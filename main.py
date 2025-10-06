@@ -58,10 +58,28 @@ MSG_PREFIX = f"**{BRAND} Giveaway** —"
 EMBED_COLOR = 0xFF8383
 EMBED_THUMB_URL = os.getenv("EMBED_THUMB_URL", "https://nox-rp.ir/media/site/icon4.png")
 
-# Allow overriding the registration DM via env; fallback to English
-REGISTRATION_DM_MESSAGE = os.getenv(
-    "REGISTRATION_DM_MESSAGE",
-    "To participate in the giveaway, please register and complete your profile at https://nox-rp.ir/",
+# Bilingual DM messages (FA/EN). For backward compatibility, if
+# REGISTRATION_DM_MESSAGE is set, it is used as English content.
+REGISTRATION_DM_MESSAGE_EN = os.getenv(
+    "REGISTRATION_DM_MESSAGE_EN",
+    os.getenv(
+        "REGISTRATION_DM_MESSAGE",
+        "To participate in the giveaway, please register and complete your profile at https://nox-rp.ir/",
+    ),
+)
+REGISTRATION_DM_MESSAGE_FA = os.getenv(
+    "REGISTRATION_DM_MESSAGE_FA",
+    "برای شرکت در قرعه‌کشی، لطفاً در وب‌سایت ثبت‌نام کرده و پروفایل خود را تکمیل کنید: https://nox-rp.ir/",
+)
+
+# Quiet-hours DM messages (FA/EN)
+QUIET_HOURS_MESSAGE_EN = os.getenv(
+    "QUIET_HOURS_MESSAGE_EN",
+    "The channel is in quiet hours. Please try again later.",
+)
+QUIET_HOURS_MESSAGE_FA = os.getenv(
+    "QUIET_HOURS_MESSAGE_FA",
+    "کانال در ساعات سکوت است. لطفاً بعداً تلاش کنید.",
 )
 
 def make_embed(title: str, description: str = "", *, fields: Optional[list] = None) -> discord.Embed:
@@ -219,10 +237,9 @@ def msg_deleted_non_reply() -> discord.Embed:
     )
 
 def msg_quiet_hours() -> discord.Embed:
-    return make_embed(
-        "Quiet Hours",
-        "The channel is in quiet hours. Please try again later.",
-    )
+    title = "ساعت سکوت | Quiet Hours"
+    desc = f"🇮🇷 {QUIET_HOURS_MESSAGE_FA}\n\n🇬🇧 {QUIET_HOURS_MESSAGE_EN}"
+    return make_embed(title, desc)
 
 def msg_winner(user: discord.Member) -> discord.Embed:
     return make_embed(
@@ -237,10 +254,9 @@ def msg_alert(seconds: int) -> discord.Embed:
     )
 
 def msg_registration_dm() -> discord.Embed:
-    return make_embed(
-        "Registration Required",
-        REGISTRATION_DM_MESSAGE,
-    )
+    title = "ثبت‌نام لازم است | Registration Required"
+    desc = f"🇮🇷 {REGISTRATION_DM_MESSAGE_FA}\n\n🇬🇧 {REGISTRATION_DM_MESSAGE_EN}"
+    return make_embed(title, desc)
 
 # ---------------- Helpers ----------------
 def _parse_hhmm(s: str) -> dt.time:
@@ -590,11 +606,9 @@ async def on_message(message: discord.Message):
 
     # Participant role requirement
     if not admin and not has_participant_role(message.author):
-        if message.author.id not in notified_missing_role:
-            with contextlib.suppress(discord.Forbidden):
-                await message.author.send(embed=msg_registration_dm())
-            notified_missing_role.add(message.author.id)
-            persist_notified_users()
+        # Send bilingual registration DM every time
+        with contextlib.suppress(discord.Forbidden):
+            await message.author.send(embed=msg_registration_dm())
         # Small delay so the user reliably sees removal client-side
         await asyncio.sleep(1)
         with contextlib.suppress(discord.Forbidden, discord.NotFound):
