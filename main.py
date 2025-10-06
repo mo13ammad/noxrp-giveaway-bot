@@ -590,13 +590,15 @@ async def on_message(message: discord.Message):
 
     # Participant role requirement
     if not admin and not has_participant_role(message.author):
-        with contextlib.suppress(discord.Forbidden, discord.NotFound):
-            await message.delete()
         if message.author.id not in notified_missing_role:
             with contextlib.suppress(discord.Forbidden):
                 await message.author.send(embed=msg_registration_dm())
             notified_missing_role.add(message.author.id)
             persist_notified_users()
+        # Small delay so the user reliably sees removal client-side
+        await asyncio.sleep(1)
+        with contextlib.suppress(discord.Forbidden, discord.NotFound):
+            await message.delete()
         return
 
     # Quiet hours: delete from members having quiet roles (admins exempt)
