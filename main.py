@@ -15,8 +15,12 @@
 
 import os
 import asyncio
+import contextlib
 import datetime as dt
-from typing import Optional
+import json
+import sqlite3
+import threading
+from typing import Dict, Optional, Set
 
 import discord
 from discord import app_commands
@@ -29,6 +33,7 @@ CHANNEL_ID            = int(os.getenv("CHANNEL_ID", "0"))                 # Requ
 TARGET_MESSAGE_ID     = int(os.getenv("TARGET_MESSAGE_ID", "0"))          # Required
 ADMIN_ROLE_IDS        = {int(x) for x in os.getenv("ADMIN_ROLE_IDS", "").split(",") if x.strip().isdigit()}
 QUIET_ROLE_IDS        = {int(x) for x in os.getenv("QUIET_ROLE_IDS", "").split(",") if x.strip().isdigit()}
+PARTICIPANT_ROLE_IDS  = {int(x) for x in os.getenv("PARTICIPANT_ROLE_IDS", "").split(",") if x.strip().isdigit()}
 
 COUNTDOWN_SECONDS     = int(os.getenv("COUNTDOWN_SECONDS", "60"))         # e.g., 60
 TICK_RATE             = float(os.getenv("TICK_RATE", "1.0"))              # seconds between UI updates
@@ -40,10 +45,94 @@ QUIET_END             = os.getenv("QUIET_END", "09:00")
 
 BOT_TOKEN             = os.getenv("DISCORD_BOT_TOKEN", "")
 ALERT_AT_SECONDS     = int(os.getenv("ALERT_AT_SECONDS", "10"))
+INVITE_BONUS_SECONDS = int(os.getenv("INVITE_BONUS_SECONDS", "10"))
+STATE_DB_PATH        = os.getenv("STATE_DB_PATH", "giveaway_state.db")
 
 # ---------------- Messages (EN - Nox RP) ----------------
 BRAND = "Nox RP"
 MSG_PREFIX = f"**{BRAND} Giveaway** —"
+REGISTRATION_DM_MESSAGE = (
+    "کاربر گرامی برای شرکت در مسابقه باید در وب سایت https://nox-rp.ir ثبت نام و مشخصات خود را تکمیل کنید"
+)
+
+
+class StateStore:
+    def __init__(self, path: str):
+        self._path = path
+        self._lock = threading.Lock()
+        self._conn = sqlite3.connect(self._path, check_same_thread=False)
+        with self._conn:
+            self._conn.execute(
+                "CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
+            )
+
+    def _set(self, key: str, value: Dict):
+        payload = json.dumps(value)
+        with self._lock, self._conn:
+            self._conn.execute(
+                "REPLACE INTO kv (key, value) VALUES (?, ?)",
+                (key, payload),
+            )
+
+    def _get(self, key: str) -> Optional[Dict]:
+        with self._lock:
+            cursor = self._conn.execute("SELECT value FROM kv WHERE key = ?", (key,))
+            row = cursor.fetchone()
+        if not row:
+            return None
+        try:
+            return json.loads(row[0])
+        except json.JSONDecodeError:
+            return None
+
+    def _delete(self, key: str):
+        with self._lock, self._conn:
+            self._conn.execute("DELETE FROM kv WHERE key = ?", (key,))
+
+    def save_active_state(
+        self,
+        *,
+        user_id: Optional[int],
+        active_until: Optional[str],
+        source_msg_id: Optional[int],
+        countdown_msg_id: Optional[int],
+    ):
+        if user_id is None or active_until is None:
+            self._delete("active_state")
+            return
+        self._set(
+            "active_state",
+            {
+                "user_id": user_id,
+                "active_until": active_until,
+                "source_msg_id": source_msg_id,
+                "countdown_message_id": countdown_msg_id,
+            },
+        )
+
+    def load_active_state(self) -> Optional[Dict]:
+        return self._get("active_state")
+
+    def clear_active_state(self):
+        self._delete("active_state")
+
+    def save_channel_locked(self, locked: bool):
+        self._set("channel_locked", {"locked": bool(locked)})
+
+    def load_channel_locked(self) -> bool:
+        data = self._get("channel_locked") or {}
+        return bool(data.get("locked", False))
+
+    def save_notified_users(self, user_ids: Set[int]):
+        self._set("notified_users", {"ids": sorted(user_ids)})
+
+    def load_notified_users(self) -> Set[int]:
+        data = self._get("notified_users") or {}
+        ids = data.get("ids", [])
+        try:
+            return {int(x) for x in ids}
+        except (TypeError, ValueError):
+            return set()
 
 def msg_countdown(user: discord.Member, seconds_left: int) -> str:
     return (
@@ -88,19 +177,42 @@ def is_admin(member: discord.Member) -> bool:
 def has_quiet_role(member: discord.Member) -> bool:
     return any(r.id in QUIET_ROLE_IDS for r in member.roles)
 
+def has_participant_role(member: discord.Member) -> bool:
+    if not PARTICIPANT_ROLE_IDS:
+        return True
+    return any(r.id in PARTICIPANT_ROLE_IDS for r in member.roles)
+
 # ---------------- Bot Setup ----------------
 intents = discord.Intents.default()
 intents.message_content = True
 intents.members = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
+state_store = StateStore(STATE_DB_PATH)
+
 # Runtime state
 active_user_id: Optional[int] = None
 active_until: Optional[dt.datetime] = None
 active_countdown_msg: Optional[discord.Message] = None
+active_countdown_msg_id: Optional[int] = None
 active_source_msg_id: Optional[int] = None  # the user's replied message id (should be TARGET_MESSAGE_ID, sanity)
 countdown_task: Optional[asyncio.Task] = None
-channel_locked_forever: bool = False
+channel_locked_forever: bool = state_store.load_channel_locked()
+notified_missing_role: Set[int] = set(state_store.load_notified_users())
+invite_uses: Dict[int, Dict[str, int]] = {}
+state_restored: bool = False
+
+def persist_active_state():
+    iso_until = active_until.isoformat() if active_until else None
+    state_store.save_active_state(
+        user_id=active_user_id,
+        active_until=iso_until,
+        source_msg_id=active_source_msg_id,
+        countdown_msg_id=active_countdown_msg_id,
+    )
+
+def persist_notified_users():
+    state_store.save_notified_users(notified_missing_role)
 
 async def lock_channel_permanently(channel: discord.TextChannel):
     global channel_locked_forever
@@ -108,37 +220,98 @@ async def lock_channel_permanently(channel: discord.TextChannel):
     overwrites[channel.guild.default_role] = discord.PermissionOverwrite(send_messages=False)
     await channel.edit(overwrites=overwrites, reason=f"{BRAND} Giveaway: locked after winner declared")
     channel_locked_forever = True
+    state_store.save_channel_locked(True)
 
-async def clear_active():
-    global active_user_id, active_until, active_countdown_msg, active_source_msg_id, countdown_task
+async def clear_active(skip_cancel: bool = False):
+    global active_user_id, active_until, active_countdown_msg, active_source_msg_id, countdown_task, active_countdown_msg_id
     active_user_id = None
     active_until = None
     active_source_msg_id = None
+    active_countdown_msg_id = None
     if active_countdown_msg:
         with contextlib.suppress(discord.NotFound, discord.Forbidden):
             await active_countdown_msg.delete()
     active_countdown_msg = None
     if countdown_task and not countdown_task.done():
-        countdown_task.cancel()
-    countdown_task = None
+        if skip_cancel:
+            countdown_task = None
+        else:
+            countdown_task.cancel()
+            countdown_task = None
+    else:
+        countdown_task = None
+    state_store.clear_active_state()
 
-import contextlib
+async def apply_invite_bonus(inviter: discord.Member, invite_count: int):
+    global active_until, active_countdown_msg
 
-async def start_countdown(channel: discord.TextChannel, participant: discord.Member, reply_to: discord.Message):
-    global active_user_id, active_until, active_countdown_msg, active_source_msg_id, countdown_task
+    if invite_count <= 0 or INVITE_BONUS_SECONDS <= 0:
+        return
+
+    if active_user_id != inviter.id or not active_until:
+        return
+
+    reduction_seconds = INVITE_BONUS_SECONDS * invite_count
+    active_until -= dt.timedelta(seconds=reduction_seconds)
+
+    now = dt.datetime.utcnow()
+    if active_until < now:
+        active_until = now
+
+    remaining = int((active_until - now).total_seconds())
+
+    if active_countdown_msg:
+        with contextlib.suppress(discord.HTTPException, discord.Forbidden):
+            await active_countdown_msg.edit(content=msg_countdown(inviter, remaining))
+
+    persist_active_state()
+
+
+async def start_countdown(
+    channel: discord.TextChannel,
+    participant: discord.Member,
+    reply_to: discord.Message,
+    *,
+    resume_until: Optional[dt.datetime] = None,
+    existing_message: Optional[discord.Message] = None,
+):
+    global active_user_id, active_until, active_countdown_msg, active_source_msg_id, countdown_task, active_countdown_msg_id
 
     # Cancel previous
     if countdown_task and not countdown_task.done():
         countdown_task.cancel()
-    if active_countdown_msg:
+    if (
+        active_countdown_msg
+        and (existing_message is None or active_countdown_msg.id != existing_message.id)
+    ):
         with contextlib.suppress(discord.NotFound, discord.Forbidden):
             await active_countdown_msg.delete()
 
     active_user_id = participant.id
     active_source_msg_id = reply_to.id
-    active_until = dt.datetime.utcnow() + dt.timedelta(seconds=COUNTDOWN_SECONDS)
 
-    active_countdown_msg = await reply_to.reply(msg_countdown(participant, COUNTDOWN_SECONDS), mention_author=False)
+    now = dt.datetime.utcnow()
+    if resume_until and resume_until > now:
+        active_until = resume_until
+        initial_remaining = int((resume_until - now).total_seconds())
+    else:
+        active_until = now + dt.timedelta(seconds=COUNTDOWN_SECONDS)
+        initial_remaining = COUNTDOWN_SECONDS
+
+    if existing_message:
+        active_countdown_msg = existing_message
+        active_countdown_msg_id = existing_message.id
+        with contextlib.suppress(discord.HTTPException, discord.Forbidden):
+            await active_countdown_msg.edit(
+                content=msg_countdown(participant, initial_remaining)
+            )
+    else:
+        active_countdown_msg = await reply_to.reply(
+            msg_countdown(participant, initial_remaining), mention_author=False
+        )
+        active_countdown_msg_id = active_countdown_msg.id
+
+    persist_active_state()
 
     async def run_countdown():
         nonlocal participant, channel
@@ -149,8 +322,8 @@ async def start_countdown(channel: discord.TextChannel, participant: discord.Mem
                     return
                 if active_user_id != participant.id:
                     return  # taken over
-                now = dt.datetime.utcnow()
-                remaining = int((active_until - now).total_seconds()) if active_until else 0
+                now_tick = dt.datetime.utcnow()
+                remaining = int((active_until - now_tick).total_seconds()) if active_until else 0
                 if remaining == ALERT_AT_SECONDS:
                     alert_msg = f"⚠️ {MSG_PREFIX} only **{ALERT_AT_SECONDS} seconds** left! @here"
                     with contextlib.suppress(discord.Forbidden):
@@ -159,18 +332,91 @@ async def start_countdown(channel: discord.TextChannel, participant: discord.Mem
                     # Declare winner and lock channel
                     await channel.send(msg_winner(participant))
                     await lock_channel_permanently(channel)
+                    await clear_active(skip_cancel=True)
                     return
                 # Update countdown message
-                with contextlib.suppress(discord.HTTPException, discord.Forbidden):
-                    await active_countdown_msg.edit(content=msg_countdown(participant, remaining))
+                if active_countdown_msg:
+                    with contextlib.suppress(discord.HTTPException, discord.Forbidden):
+                        await active_countdown_msg.edit(
+                            content=msg_countdown(participant, remaining)
+                        )
         except asyncio.CancelledError:
             return
 
     countdown_task = asyncio.create_task(run_countdown())
 
+async def restore_persisted_state():
+    global active_user_id, active_until, active_source_msg_id, active_countdown_msg, active_countdown_msg_id
+
+    if channel_locked_forever:
+        state_store.clear_active_state()
+        return
+
+    stored = state_store.load_active_state()
+    if not stored:
+        return
+
+    channel = bot.get_channel(CHANNEL_ID)
+    if channel is None:
+        try:
+            channel = await bot.fetch_channel(CHANNEL_ID)
+        except discord.HTTPException:
+            return
+
+    if not isinstance(channel, discord.TextChannel):
+        return
+
+    try:
+        base_msg = await channel.fetch_message(TARGET_MESSAGE_ID)
+    except discord.NotFound:
+        state_store.clear_active_state()
+        return
+
+    user_id = stored.get("user_id")
+    if not user_id:
+        state_store.clear_active_state()
+        return
+
+    participant = channel.guild.get_member(user_id)
+    if participant is None:
+        try:
+            participant = await channel.guild.fetch_member(user_id)
+        except (discord.NotFound, discord.HTTPException):
+            participant = None
+    if participant is None:
+        state_store.clear_active_state()
+        return
+
+    countdown_msg = None
+    countdown_msg_id = stored.get("countdown_message_id")
+    if countdown_msg_id:
+        with contextlib.suppress(discord.HTTPException, discord.NotFound):
+            countdown_msg = await channel.fetch_message(countdown_msg_id)
+
+    try:
+        resume_until = dt.datetime.fromisoformat(stored.get("active_until"))
+    except (TypeError, ValueError):
+        state_store.clear_active_state()
+        return
+
+    if resume_until <= dt.datetime.utcnow():
+        await channel.send(msg_winner(participant))
+        await lock_channel_permanently(channel)
+        await clear_active(skip_cancel=True)
+        return
+
+    await start_countdown(
+        channel,
+        participant,
+        base_msg,
+        resume_until=resume_until,
+        existing_message=countdown_msg,
+    )
+
 # ---------------- Event Handlers ----------------
 @bot.event
 async def on_ready():
+    global state_restored
     try:
         if GUILD_ID:
             guild = bot.get_guild(GUILD_ID)
@@ -180,6 +426,18 @@ async def on_ready():
             await bot.tree.sync()
     except Exception:
         pass
+    for guild in bot.guilds:
+        try:
+            invites = await guild.invites()
+        except (discord.Forbidden, discord.HTTPException):
+            invite_uses[guild.id] = {}
+        else:
+            invite_uses[guild.id] = {invite.code: invite.uses or 0 for invite in invites}
+
+    if not state_restored:
+        await restore_persisted_state()
+        state_restored = True
+
     print(f"[{BRAND}] Giveaway bot is online as {bot.user}.")
 
 @bot.event
@@ -202,6 +460,17 @@ async def on_message(message: discord.Message):
 
     # Admins are exempt from all restrictions (but still can interact)
     admin = is_admin(message.author)
+
+    # Participant role requirement
+    if not admin and not has_participant_role(message.author):
+        with contextlib.suppress(discord.Forbidden, discord.NotFound):
+            await message.delete()
+        if message.author.id not in notified_missing_role:
+            with contextlib.suppress(discord.Forbidden):
+                await message.author.send(REGISTRATION_DM_MESSAGE)
+            notified_missing_role.add(message.author.id)
+            persist_notified_users()
+        return
 
     # Quiet hours: delete from members having quiet roles (admins exempt)
     if not admin and in_quiet_hours() and has_quiet_role(message.author):
@@ -250,6 +519,49 @@ async def on_message(message: discord.Message):
         with contextlib.suppress(discord.Forbidden, discord.NotFound):
             await note.delete()
 
+@bot.event
+async def on_member_join(member: discord.Member):
+    try:
+        invites = await member.guild.invites()
+    except (discord.Forbidden, discord.HTTPException):
+        return
+
+    guild_invites = invite_uses.get(member.guild.id, {})
+    used_invite = None
+    usage_increase = 0
+    for invite in invites:
+        previous_uses = guild_invites.get(invite.code, 0)
+        current_uses = invite.uses or 0
+        if current_uses > previous_uses:
+            used_invite = invite
+            usage_increase = current_uses - previous_uses
+            break
+
+    invite_uses[member.guild.id] = {invite.code: invite.uses or 0 for invite in invites}
+
+    if not used_invite or not used_invite.inviter:
+        return
+
+    inviter_member = member.guild.get_member(used_invite.inviter.id)
+    if not inviter_member:
+        return
+
+    await apply_invite_bonus(inviter_member, usage_increase)
+
+@bot.event
+async def on_invite_create(invite: discord.Invite):
+    if not invite.guild:
+        return
+    guild_invites = invite_uses.setdefault(invite.guild.id, {})
+    guild_invites[invite.code] = invite.uses or 0
+
+@bot.event
+async def on_invite_delete(invite: discord.Invite):
+    if not invite.guild:
+        return
+    guild_invites = invite_uses.setdefault(invite.guild.id, {})
+    guild_invites.pop(invite.code, None)
+
 # ---------------- Admin Slash: /unlock (optional safeguard) ----------------
 # Keeps things simple: we DON'T reopen automatically after winner.
 # But admins can unlock manually if they ever need to.
@@ -264,6 +576,7 @@ async def unlock(interaction: discord.Interaction):
     overwrites[interaction.guild.default_role] = discord.PermissionOverwrite(send_messages=True)
     await interaction.channel.edit(overwrites=overwrites, reason=f"{BRAND} Admin unlock")
     channel_locked_forever = False
+    state_store.save_channel_locked(False)
     await interaction.response.send_message(f"{MSG_PREFIX} channel unlocked by admin.", ephemeral=True)
 
 # ---------------- Main ----------------
