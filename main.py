@@ -54,11 +54,25 @@ INVITE_MIN_ACCOUNT_AGE_DAYS = int(os.getenv("INVITE_MIN_ACCOUNT_AGE_DAYS", "3"))
 # ---------------- Messages (EN - Nox RP) ----------------
 BRAND = "Nox RP"
 MSG_PREFIX = f"**{BRAND} Giveaway** —"
-# Allow overriding the registration DM via env; fallback to the default Persian message
+# Embed styling
+EMBED_COLOR = 0xFF8383
+EMBED_THUMB_URL = os.getenv("EMBED_THUMB_URL", "https://nox-rp.ir/media/site/icon4.png")
+
+# Allow overriding the registration DM via env; fallback to English
 REGISTRATION_DM_MESSAGE = os.getenv(
     "REGISTRATION_DM_MESSAGE",
-    "کاربر گرامی برای شرکت در مسابقه باید در وب سایت https://nox-rp.ir ثبت نام و مشخصات خود را تکمیل کنید",
+    "To participate in the giveaway, please register and complete your profile at https://nox-rp.ir/",
 )
+
+def make_embed(title: str, description: str = "", *, fields: Optional[list] = None) -> discord.Embed:
+    emb = discord.Embed(title=title, description=description, color=EMBED_COLOR)
+    emb.set_author(name=f"{BRAND} Giveaway")
+    if EMBED_THUMB_URL:
+        emb.set_thumbnail(url=EMBED_THUMB_URL)
+    if fields:
+        for name, value, inline in fields:
+            emb.add_field(name=name, value=value, inline=inline)
+    return emb
 
 
 class StateStore:
@@ -173,30 +187,60 @@ def _get_user_stats(uid: int) -> Dict:
         user_stats[uid] = s
     return s
 
-def msg_countdown(user: discord.Member, seconds_left: int) -> str:
+def msg_countdown(user: discord.Member, seconds_left: int) -> discord.Embed:
     s = _get_user_stats(user.id)
     inv_applied = int(s.get("invites_applied", 0))
     inv_secs = int(s.get("invite_seconds_applied", 0))
     role_applied = int(s.get("role_bonuses_applied", 0))
     role_secs = int(s.get("role_seconds_applied", 0))
     total_bonus = inv_secs + role_secs
-    return (
-        f"{MSG_PREFIX} countdown running for {user.mention}.\n"
-        f"⏳ **{seconds_left}s** remaining... Reply to the target message to take over!\n\n"
-        f"📊 وضعیت: دعوت‌های اعمال‌شده: {inv_applied} (−{inv_secs}s) | پاداش نقش‌های اعمال‌شده: {role_applied} (−{role_secs}s) | مجموع بونوس: −{total_bonus}s"
+    desc = (
+        f"Active participant: {user.mention}\n"
+        f"⏳ Remaining: **{seconds_left}s**\n"
+        f"Reply to the pinned target message to take over."
+    )
+    fields = [
+        ("Invites Applied", f"{inv_applied} (−{inv_secs}s)", True),
+        ("Role Bonuses Applied", f"{role_applied} (−{role_secs}s)", True),
+        ("Total Bonus", f"−{total_bonus}s", True),
+    ]
+    return make_embed("Giveaway Countdown", desc, fields=fields)
+
+def msg_taken_over(new_user: discord.Member) -> discord.Embed:
+    return make_embed(
+        "New Participant",
+        f"{new_user.mention} has taken over. Countdown restarted.",
     )
 
-def msg_taken_over(new_user: discord.Member) -> str:
-    return f"{MSG_PREFIX} new participant: {new_user.mention}. Countdown restarted."
+def msg_deleted_non_reply() -> discord.Embed:
+    return make_embed(
+        "How To Participate",
+        "Please reply to the pinned target message to participate.",
+    )
 
-def msg_deleted_non_reply() -> str:
-    return f"{MSG_PREFIX} please reply to the pinned target message to participate."
+def msg_quiet_hours() -> discord.Embed:
+    return make_embed(
+        "Quiet Hours",
+        "The channel is in quiet hours. Please try again later.",
+    )
 
-def msg_quiet_hours() -> str:
-    return f"{MSG_PREFIX} channel is in quiet hours. Please try again later."
+def msg_winner(user: discord.Member) -> discord.Embed:
+    return make_embed(
+        "Winner Announced",
+        f"🏆 Winner: **{user.display_name}**. The channel is now locked.",
+    )
 
-def msg_winner(user: discord.Member) -> str:
-    return f"🏆 {MSG_PREFIX} winner: **{user.display_name}**! The channel is now locked."
+def msg_alert(seconds: int) -> discord.Embed:
+    return make_embed(
+        "Countdown Alert",
+        f"Only **{seconds} seconds** left!",
+    )
+
+def msg_registration_dm() -> discord.Embed:
+    return make_embed(
+        "Registration Required",
+        REGISTRATION_DM_MESSAGE,
+    )
 
 # ---------------- Helpers ----------------
 def _parse_hhmm(s: str) -> dt.time:
@@ -314,7 +358,7 @@ async def reduce_active_time(inviter: discord.Member, seconds: int):
 
     if active_countdown_msg:
         with contextlib.suppress(discord.HTTPException, discord.Forbidden):
-            await active_countdown_msg.edit(content=msg_countdown(inviter, remaining))
+            await active_countdown_msg.edit(embed=msg_countdown(inviter, remaining))
 
     persist_active_state()
 
@@ -380,11 +424,11 @@ async def start_countdown(
         active_countdown_msg_id = existing_message.id
         with contextlib.suppress(discord.HTTPException, discord.Forbidden):
             await active_countdown_msg.edit(
-                content=msg_countdown(participant, initial_remaining)
+                embed=msg_countdown(participant, initial_remaining)
             )
     else:
         active_countdown_msg = await reply_to.reply(
-            msg_countdown(participant, initial_remaining), mention_author=False
+            embed=msg_countdown(participant, initial_remaining), mention_author=False
         )
         active_countdown_msg_id = active_countdown_msg.id
 
@@ -402,12 +446,12 @@ async def start_countdown(
                 now_tick = dt.datetime.utcnow()
                 remaining = int((active_until - now_tick).total_seconds()) if active_until else 0
                 if remaining == ALERT_AT_SECONDS:
-                    alert_msg = f"⚠️ {MSG_PREFIX} only **{ALERT_AT_SECONDS} seconds** left! @here"
+                    alert_msg = f"@here"
                     with contextlib.suppress(discord.Forbidden):
-                        await channel.send(alert_msg)
+                        await channel.send(content=alert_msg, embed=msg_alert(ALERT_AT_SECONDS))
                 if remaining <= 0:
                     # Declare winner and lock channel
-                    await channel.send(msg_winner(participant))
+                    await channel.send(embed=msg_winner(participant))
                     await lock_channel_permanently(channel)
                     await clear_active(skip_cancel=True)
                     return
@@ -415,7 +459,7 @@ async def start_countdown(
                 if active_countdown_msg:
                     with contextlib.suppress(discord.HTTPException, discord.Forbidden):
                         await active_countdown_msg.edit(
-                            content=msg_countdown(participant, remaining)
+                            embed=msg_countdown(participant, remaining)
                         )
         except asyncio.CancelledError:
             return
@@ -477,7 +521,7 @@ async def restore_persisted_state():
         return
 
     if resume_until <= dt.datetime.utcnow():
-        await channel.send(msg_winner(participant))
+        await channel.send(embed=msg_winner(participant))
         await lock_channel_permanently(channel)
         await clear_active(skip_cancel=True)
         return
@@ -550,7 +594,7 @@ async def on_message(message: discord.Message):
             await message.delete()
         if message.author.id not in notified_missing_role:
             with contextlib.suppress(discord.Forbidden):
-                await message.author.send(REGISTRATION_DM_MESSAGE)
+                await message.author.send(embed=msg_registration_dm())
             notified_missing_role.add(message.author.id)
             persist_notified_users()
         return
@@ -560,7 +604,7 @@ async def on_message(message: discord.Message):
         with contextlib.suppress(discord.Forbidden, discord.NotFound):
             await message.delete()
         with contextlib.suppress(discord.Forbidden):
-            await message.author.send(msg_quiet_hours())
+            await message.author.send(embed=msg_quiet_hours())
         return
 
     # Must be a REPLY to the configured target message
@@ -576,7 +620,7 @@ async def on_message(message: discord.Message):
                 await message.delete()
             # Optionally nudge (avoid DM spam by replying ephemerally—Discord bots can't true-ephemeral in text channels)
             with contextlib.suppress(discord.Forbidden):
-                warn = await message.channel.send(msg_deleted_non_reply(), delete_after=5)
+                warn = await message.channel.send(embed=msg_deleted_non_reply(), delete_after=5)
         return
 
     # If current participant tries to speak during their own countdown, delete their message
@@ -597,7 +641,7 @@ async def on_message(message: discord.Message):
     await start_countdown(message.channel, message.author, base_msg)
     # Optional short confirmation
     with contextlib.suppress(discord.Forbidden):
-        note = await message.reply(msg_taken_over(message.author), mention_author=False)
+        note = await message.reply(embed=msg_taken_over(message.author), mention_author=False)
         await asyncio.sleep(2)
         with contextlib.suppress(discord.Forbidden, discord.NotFound):
             await note.delete()

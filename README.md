@@ -25,7 +25,8 @@ python main.py
 | `PARTICIPANT_ROLE_IDS` | Comma-separated role IDs allowed to participate; others receive a registration DM. Leave empty to allow everyone. |
 | `COUNTDOWN_SECONDS` | Countdown duration for each participant. |
 | `INVITE_BONUS_SECONDS` | Seconds removed from the countdown per successful invite (default `10`). |
-| `REGISTRATION_DM_MESSAGE` | DM text sent to users without participant role (default Persian message provided). |
+| `REGISTRATION_DM_MESSAGE` | DM text sent to users without participant role (default English message provided). |
+| `EMBED_THUMB_URL` | URL of thumbnail displayed in embeds (default Nox RP icon). |
 | `STATE_DB_PATH` | Path to the local SQLite database used to persist giveaway progress (default `giveaway_state.db`). |
 | `INVITE_ROLE_BONUS_SECONDS` | Extra seconds removed when an invited user later gains a participant role. |
 | `INVITE_MIN_ACCOUNT_AGE_DAYS` | Minimum account age (days) for an invited user to be eligible for any bonus. |
