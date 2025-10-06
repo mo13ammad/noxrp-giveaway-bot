@@ -51,8 +51,10 @@ STATE_DB_PATH        = os.getenv("STATE_DB_PATH", "giveaway_state.db")
 # ---------------- Messages (EN - Nox RP) ----------------
 BRAND = "Nox RP"
 MSG_PREFIX = f"**{BRAND} Giveaway** —"
-REGISTRATION_DM_MESSAGE = (
-    "کاربر گرامی برای شرکت در مسابقه باید در وب سایت https://nox-rp.ir ثبت نام و مشخصات خود را تکمیل کنید"
+# Allow overriding the registration DM via env; fallback to the default Persian message
+REGISTRATION_DM_MESSAGE = os.getenv(
+    "REGISTRATION_DM_MESSAGE",
+    "کاربر گرامی برای شرکت در مسابقه باید در وب سایت https://nox-rp.ir ثبت نام و مشخصات خود را تکمیل کنید",
 )
 
 

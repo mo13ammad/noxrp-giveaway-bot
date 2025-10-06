@@ -24,4 +24,10 @@ python main.py
 | `PARTICIPANT_ROLE_IDS` | Comma-separated role IDs allowed to participate; others receive a registration DM. Leave empty to allow everyone. |
 | `COUNTDOWN_SECONDS` | Countdown duration for each participant. |
 | `INVITE_BONUS_SECONDS` | Seconds removed from the countdown per successful invite (default `10`). |
+| `REGISTRATION_DM_MESSAGE` | DM text sent to users without participant role (default Persian message provided). |
 | `STATE_DB_PATH` | Path to the local SQLite database used to persist giveaway progress (default `giveaway_state.db`). |
+
+### Permissions & Intents
+
+- Enable `Message Content Intent` and `Server Members Intent` for the bot in the Developer Portal.
+- Grant the bot permission to view the giveaway channel, manage messages, and fetch invites (`Manage Guild` or appropriate invite permissions) so invite bonuses work.
