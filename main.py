@@ -16,7 +16,7 @@
 import os
 import asyncio
 import datetime as dt
-from typing import Optional
+from typing import Dict, Optional, Set
 
 import discord
 from discord import app_commands
@@ -29,6 +29,7 @@ CHANNEL_ID            = int(os.getenv("CHANNEL_ID", "0"))                 # Requ
 TARGET_MESSAGE_ID     = int(os.getenv("TARGET_MESSAGE_ID", "0"))          # Required
 ADMIN_ROLE_IDS        = {int(x) for x in os.getenv("ADMIN_ROLE_IDS", "").split(",") if x.strip().isdigit()}
 QUIET_ROLE_IDS        = {int(x) for x in os.getenv("QUIET_ROLE_IDS", "").split(",") if x.strip().isdigit()}
+PARTICIPANT_ROLE_IDS  = {int(x) for x in os.getenv("PARTICIPANT_ROLE_IDS", "").split(",") if x.strip().isdigit()}
 
 COUNTDOWN_SECONDS     = int(os.getenv("COUNTDOWN_SECONDS", "60"))         # e.g., 60
 TICK_RATE             = float(os.getenv("TICK_RATE", "1.0"))              # seconds between UI updates
@@ -40,10 +41,14 @@ QUIET_END             = os.getenv("QUIET_END", "09:00")
 
 BOT_TOKEN             = os.getenv("DISCORD_BOT_TOKEN", "")
 ALERT_AT_SECONDS     = int(os.getenv("ALERT_AT_SECONDS", "10"))
+INVITE_BONUS_SECONDS = int(os.getenv("INVITE_BONUS_SECONDS", "10"))
 
 # ---------------- Messages (EN - Nox RP) ----------------
 BRAND = "Nox RP"
 MSG_PREFIX = f"**{BRAND} Giveaway** —"
+REGISTRATION_DM_MESSAGE = (
+    "کاربر گرامی برای شرکت در مسابقه باید در وب سایت https://nox-rp.ir ثبت نام و مشخصات خود را تکمیل کنید"
+)
 
 def msg_countdown(user: discord.Member, seconds_left: int) -> str:
     return (
@@ -88,6 +93,11 @@ def is_admin(member: discord.Member) -> bool:
 def has_quiet_role(member: discord.Member) -> bool:
     return any(r.id in QUIET_ROLE_IDS for r in member.roles)
 
+def has_participant_role(member: discord.Member) -> bool:
+    if not PARTICIPANT_ROLE_IDS:
+        return True
+    return any(r.id in PARTICIPANT_ROLE_IDS for r in member.roles)
+
 # ---------------- Bot Setup ----------------
 intents = discord.Intents.default()
 intents.message_content = True
@@ -101,6 +111,8 @@ active_countdown_msg: Optional[discord.Message] = None
 active_source_msg_id: Optional[int] = None  # the user's replied message id (should be TARGET_MESSAGE_ID, sanity)
 countdown_task: Optional[asyncio.Task] = None
 channel_locked_forever: bool = False
+notified_missing_role: Set[int] = set()
+invite_uses: Dict[int, Dict[str, int]] = {}
 
 async def lock_channel_permanently(channel: discord.TextChannel):
     global channel_locked_forever
@@ -121,6 +133,28 @@ async def clear_active():
     if countdown_task and not countdown_task.done():
         countdown_task.cancel()
     countdown_task = None
+
+async def apply_invite_bonus(inviter: discord.Member, invite_count: int):
+    global active_until, active_countdown_msg
+
+    if invite_count <= 0 or INVITE_BONUS_SECONDS <= 0:
+        return
+
+    if active_user_id != inviter.id or not active_until:
+        return
+
+    reduction_seconds = INVITE_BONUS_SECONDS * invite_count
+    active_until -= dt.timedelta(seconds=reduction_seconds)
+
+    now = dt.datetime.utcnow()
+    if active_until < now:
+        active_until = now
+
+    remaining = int((active_until - now).total_seconds())
+
+    if active_countdown_msg:
+        with contextlib.suppress(discord.HTTPException, discord.Forbidden):
+            await active_countdown_msg.edit(content=msg_countdown(inviter, remaining))
 
 import contextlib
 
@@ -180,6 +214,13 @@ async def on_ready():
             await bot.tree.sync()
     except Exception:
         pass
+    for guild in bot.guilds:
+        try:
+            invites = await guild.invites()
+        except (discord.Forbidden, discord.HTTPException):
+            invite_uses[guild.id] = {}
+        else:
+            invite_uses[guild.id] = {invite.code: invite.uses or 0 for invite in invites}
     print(f"[{BRAND}] Giveaway bot is online as {bot.user}.")
 
 @bot.event
@@ -202,6 +243,16 @@ async def on_message(message: discord.Message):
 
     # Admins are exempt from all restrictions (but still can interact)
     admin = is_admin(message.author)
+
+    # Participant role requirement
+    if not admin and not has_participant_role(message.author):
+        with contextlib.suppress(discord.Forbidden, discord.NotFound):
+            await message.delete()
+        if message.author.id not in notified_missing_role:
+            with contextlib.suppress(discord.Forbidden):
+                await message.author.send(REGISTRATION_DM_MESSAGE)
+            notified_missing_role.add(message.author.id)
+        return
 
     # Quiet hours: delete from members having quiet roles (admins exempt)
     if not admin and in_quiet_hours() and has_quiet_role(message.author):
@@ -249,6 +300,49 @@ async def on_message(message: discord.Message):
         await asyncio.sleep(2)
         with contextlib.suppress(discord.Forbidden, discord.NotFound):
             await note.delete()
+
+@bot.event
+async def on_member_join(member: discord.Member):
+    try:
+        invites = await member.guild.invites()
+    except (discord.Forbidden, discord.HTTPException):
+        return
+
+    guild_invites = invite_uses.get(member.guild.id, {})
+    used_invite = None
+    usage_increase = 0
+    for invite in invites:
+        previous_uses = guild_invites.get(invite.code, 0)
+        current_uses = invite.uses or 0
+        if current_uses > previous_uses:
+            used_invite = invite
+            usage_increase = current_uses - previous_uses
+            break
+
+    invite_uses[member.guild.id] = {invite.code: invite.uses or 0 for invite in invites}
+
+    if not used_invite or not used_invite.inviter:
+        return
+
+    inviter_member = member.guild.get_member(used_invite.inviter.id)
+    if not inviter_member:
+        return
+
+    await apply_invite_bonus(inviter_member, usage_increase)
+
+@bot.event
+async def on_invite_create(invite: discord.Invite):
+    if not invite.guild:
+        return
+    guild_invites = invite_uses.setdefault(invite.guild.id, {})
+    guild_invites[invite.code] = invite.uses or 0
+
+@bot.event
+async def on_invite_delete(invite: discord.Invite):
+    if not invite.guild:
+        return
+    guild_invites = invite_uses.setdefault(invite.guild.id, {})
+    guild_invites.pop(invite.code, None)
 
 # ---------------- Admin Slash: /unlock (optional safeguard) ----------------
 # Keeps things simple: we DON'T reopen automatically after winner.
