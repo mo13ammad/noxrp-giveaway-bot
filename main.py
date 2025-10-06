@@ -47,6 +47,9 @@ BOT_TOKEN             = os.getenv("DISCORD_BOT_TOKEN", "")
 ALERT_AT_SECONDS     = int(os.getenv("ALERT_AT_SECONDS", "10"))
 INVITE_BONUS_SECONDS = int(os.getenv("INVITE_BONUS_SECONDS", "10"))
 STATE_DB_PATH        = os.getenv("STATE_DB_PATH", "giveaway_state.db")
+INVITE_ROLE_BONUS_SECONDS = int(os.getenv("INVITE_ROLE_BONUS_SECONDS", "10"))
+# Minimum account age (days) for an invited user to be eligible for any invite bonus
+INVITE_MIN_ACCOUNT_AGE_DAYS = int(os.getenv("INVITE_MIN_ACCOUNT_AGE_DAYS", "3"))
 
 # ---------------- Messages (EN - Nox RP) ----------------
 BRAND = "Nox RP"
@@ -136,10 +139,51 @@ class StateStore:
         except (TypeError, ValueError):
             return set()
 
+    def save_referrals(self, referrals: Dict[int, Dict]):
+        serializable = {str(k): v for k, v in referrals.items()}
+        self._set("referrals", serializable)
+
+    def load_referrals(self) -> Dict[int, Dict]:
+        data = self._get("referrals") or {}
+        try:
+            return {int(k): v for k, v in data.items()}
+        except (ValueError, AttributeError):
+            return {}
+
+    def save_user_stats(self, stats: Dict[int, Dict]):
+        serializable = {str(k): v for k, v in stats.items()}
+        self._set("user_stats", serializable)
+
+    def load_user_stats(self) -> Dict[int, Dict]:
+        data = self._get("user_stats") or {}
+        try:
+            return {int(k): v for k, v in data.items()}
+        except (ValueError, AttributeError):
+            return {}
+
+def _get_user_stats(uid: int) -> Dict:
+    s = user_stats.get(uid)
+    if not s:
+        s = {
+            "invites_applied": 0,
+            "invite_seconds_applied": 0,
+            "role_bonuses_applied": 0,
+            "role_seconds_applied": 0,
+        }
+        user_stats[uid] = s
+    return s
+
 def msg_countdown(user: discord.Member, seconds_left: int) -> str:
+    s = _get_user_stats(user.id)
+    inv_applied = int(s.get("invites_applied", 0))
+    inv_secs = int(s.get("invite_seconds_applied", 0))
+    role_applied = int(s.get("role_bonuses_applied", 0))
+    role_secs = int(s.get("role_seconds_applied", 0))
+    total_bonus = inv_secs + role_secs
     return (
         f"{MSG_PREFIX} countdown running for {user.mention}.\n"
-        f"⏳ **{seconds_left}s** remaining... Reply to the target message to take over!"
+        f"⏳ **{seconds_left}s** remaining... Reply to the target message to take over!\n\n"
+        f"📊 وضعیت: دعوت‌های اعمال‌شده: {inv_applied} (−{inv_secs}s) | پاداش نقش‌های اعمال‌شده: {role_applied} (−{role_secs}s) | مجموع بونوس: −{total_bonus}s"
     )
 
 def msg_taken_over(new_user: discord.Member) -> str:
@@ -203,6 +247,8 @@ channel_locked_forever: bool = state_store.load_channel_locked()
 notified_missing_role: Set[int] = set(state_store.load_notified_users())
 invite_uses: Dict[int, Dict[str, int]] = {}
 state_restored: bool = False
+referral_map: Dict[int, Dict] = {}
+user_stats: Dict[int, Dict] = {}
 
 def persist_active_state():
     iso_until = active_until.isoformat() if active_until else None
@@ -215,6 +261,9 @@ def persist_active_state():
 
 def persist_notified_users():
     state_store.save_notified_users(notified_missing_role)
+
+def persist_user_stats():
+    state_store.save_user_stats(user_stats)
 
 async def lock_channel_permanently(channel: discord.TextChannel):
     global channel_locked_forever
@@ -244,19 +293,20 @@ async def clear_active(skip_cancel: bool = False):
         countdown_task = None
     state_store.clear_active_state()
 
-async def apply_invite_bonus(inviter: discord.Member, invite_count: int):
-    global active_until, active_countdown_msg
+def _now_utc_naive() -> dt.datetime:
+    return dt.datetime.utcnow()
 
-    if invite_count <= 0 or INVITE_BONUS_SECONDS <= 0:
+async def reduce_active_time(inviter: discord.Member, seconds: int):
+    global active_until, active_countdown_msg
+    if seconds <= 0:
         return
 
     if active_user_id != inviter.id or not active_until:
         return
 
-    reduction_seconds = INVITE_BONUS_SECONDS * invite_count
-    active_until -= dt.timedelta(seconds=reduction_seconds)
+    active_until -= dt.timedelta(seconds=seconds)
 
-    now = dt.datetime.utcnow()
+    now = _now_utc_naive()
     if active_until < now:
         active_until = now
 
@@ -267,6 +317,31 @@ async def apply_invite_bonus(inviter: discord.Member, invite_count: int):
             await active_countdown_msg.edit(content=msg_countdown(inviter, remaining))
 
     persist_active_state()
+
+async def apply_invite_bonus(inviter: discord.Member, invite_count: int):
+    global active_user_id, active_until
+    if invite_count <= 0 or INVITE_BONUS_SECONDS <= 0:
+        return
+    seconds = INVITE_BONUS_SECONDS * invite_count
+    did_apply = active_user_id == inviter.id and active_until is not None
+    if did_apply:
+        await reduce_active_time(inviter, seconds)
+        s = _get_user_stats(inviter.id)
+        s["invites_applied"] = int(s.get("invites_applied", 0)) + invite_count
+        s["invite_seconds_applied"] = int(s.get("invite_seconds_applied", 0)) + seconds
+        persist_user_stats()
+
+async def apply_role_bonus(inviter: discord.Member):
+    global active_user_id, active_until
+    if INVITE_ROLE_BONUS_SECONDS <= 0:
+        return
+    did_apply = active_user_id == inviter.id and active_until is not None
+    if did_apply:
+        await reduce_active_time(inviter, INVITE_ROLE_BONUS_SECONDS)
+        s = _get_user_stats(inviter.id)
+        s["role_bonuses_applied"] = int(s.get("role_bonuses_applied", 0)) + 1
+        s["role_seconds_applied"] = int(s.get("role_seconds_applied", 0)) + INVITE_ROLE_BONUS_SECONDS
+        persist_user_stats()
 
 
 async def start_countdown(
@@ -439,6 +514,12 @@ async def on_ready():
     if not state_restored:
         await restore_persisted_state()
         state_restored = True
+    # Load persisted referrals once on ready
+    global referral_map
+    referral_map = state_store.load_referrals()
+    # Load user stats for displaying in countdown
+    global user_stats
+    user_stats = state_store.load_user_stats()
 
     print(f"[{BRAND}] Giveaway bot is online as {bot.user}.")
 
@@ -548,6 +629,29 @@ async def on_member_join(member: discord.Member):
     if not inviter_member:
         return
 
+    # Check minimum account age for eligibility
+    try:
+        created_at = member.created_at
+        if created_at.tzinfo is not None:
+            created_at = created_at.replace(tzinfo=None)
+    except AttributeError:
+        created_at = None
+
+    age_ok = True
+    if created_at is not None and INVITE_MIN_ACCOUNT_AGE_DAYS > 0:
+        age_ok = (_now_utc_naive() - created_at) >= dt.timedelta(days=INVITE_MIN_ACCOUNT_AGE_DAYS)
+
+    if not age_ok:
+        return  # New accounts do not count for any bonus
+
+    # Record referral for potential role-bonus later
+    referral_map[member.id] = {
+        "inviter_id": inviter_member.id,
+        "role_bonus_applied": False,
+    }
+    state_store.save_referrals(referral_map)
+
+    # Apply join-time invite bonus immediately (if inviter is currently active)
     await apply_invite_bonus(inviter_member, usage_increase)
 
 @bot.event
@@ -563,6 +667,35 @@ async def on_invite_delete(invite: discord.Invite):
         return
     guild_invites = invite_uses.setdefault(invite.guild.id, {})
     guild_invites.pop(invite.code, None)
+
+@bot.event
+async def on_member_update(before: discord.Member, after: discord.Member):
+    # Detect gaining the participant role later and reward inviter with role bonus
+    had_role_before = has_participant_role(before)
+    has_role_after = has_participant_role(after)
+    if had_role_before or not has_role_after:
+        return
+
+    info = referral_map.get(after.id)
+    if not info or info.get("role_bonus_applied"):
+        return
+
+    inviter_id = info.get("inviter_id")
+    if not inviter_id:
+        return
+
+    inviter_member = after.guild.get_member(inviter_id)
+    if not inviter_member:
+        with contextlib.suppress(discord.NotFound, discord.HTTPException):
+            inviter_member = await after.guild.fetch_member(inviter_id)
+    if not inviter_member:
+        return
+
+    await apply_role_bonus(inviter_member)
+    applied_now = active_user_id == inviter_member.id and active_until is not None
+    if applied_now:
+        info["role_bonus_applied"] = True
+        state_store.save_referrals(referral_map)
 
 # ---------------- Admin Slash: /unlock (optional safeguard) ----------------
 # Keeps things simple: we DON'T reopen automatically after winner.

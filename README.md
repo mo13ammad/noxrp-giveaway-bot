@@ -4,6 +4,7 @@
 A Discord giveaway bot for Nox RP written in Python.
 It manages countdown-based reply giveaways with quiet hours, admin exemptions, and automatic locking on winner selection.
 Countdown progress is stored in a local SQLite database so the giveaway can recover after unexpected restarts.
+The countdown message also shows the active participant's invite- and role-bonus stats (applied only).
 
 ## 🔧 Setup
 ```bash
@@ -26,8 +27,11 @@ python main.py
 | `INVITE_BONUS_SECONDS` | Seconds removed from the countdown per successful invite (default `10`). |
 | `REGISTRATION_DM_MESSAGE` | DM text sent to users without participant role (default Persian message provided). |
 | `STATE_DB_PATH` | Path to the local SQLite database used to persist giveaway progress (default `giveaway_state.db`). |
+| `INVITE_ROLE_BONUS_SECONDS` | Extra seconds removed when an invited user later gains a participant role. |
+| `INVITE_MIN_ACCOUNT_AGE_DAYS` | Minimum account age (days) for an invited user to be eligible for any bonus. |
 
 ### Permissions & Intents
 
 - Enable `Message Content Intent` and `Server Members Intent` for the bot in the Developer Portal.
 - Grant the bot permission to view the giveaway channel, manage messages, and fetch invites (`Manage Guild` or appropriate invite permissions) so invite bonuses work.
+- The role-bonus feature relies on `on_member_update` to detect when an invited user later receives a participant role.
