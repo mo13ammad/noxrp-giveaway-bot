@@ -1,0 +1,17 @@
+# (c) 2025 ViraUp (viraup.com) - All rights reserved.
+# Git ignore for Nox RP Giveaway Bot
+
+# Environment & config
+.env
+*.pyc
+__pycache__/
+.vscode/
+.idea/
+
+# Virtual environment
+.venv/
+venv/
+
+# OS files
+.DS_Store
+Thumbs.db

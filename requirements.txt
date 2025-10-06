@@ -1,0 +1,6 @@
+# (c) 2025 ViraUp (viraup.com) - All rights reserved.
+# Requirements for Nox RP Discord Giveaway Bot
+
+discord.py>=2.3.2
+python-dotenv>=1.0.1
+pytz>=2024.1
